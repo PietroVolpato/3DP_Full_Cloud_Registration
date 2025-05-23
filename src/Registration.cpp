@@ -96,8 +96,49 @@ Eigen::Matrix4d Registration::get_svd_icp_transformation(std::vector<size_t> sou
   // 4. Handle special reflection case if det(R) < 0.
   // 5. Compute translation t and build 4x4 matrix.
   ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // 1. Compute centroids
+  Eigen::Vector3d source_centroid = Eigen::Vector3d::Zero();
+  Eigen::Vector3d target_centroid = Eigen::Vector3d::Zero();
 
+  for (size_t i = 0; i < source_indices.size(); i++) {
+    source_centroid += source_for_icp_.points_[source_indices[i]];
+    target_centroid += target_.points_[target_indices[i]];
+  }
+
+  source_centroid /= source_indices.size();
+  target_centroid /= target_indices.size();
+
+  // 2. Subtract centroids and construct matrix H
+  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, 3);
+
+  for (size_t i = 0; i < source_indices.size(); i++) {
+    Eigen::Vector3d source_point = source_for_icp_.points_[source_indices[i]] - source_centroid;
+    Eigen::Vector3d target_point = target_.points_[target_indices[i]] - target_centroid;
+    H += source_point * target_point.transpose();
+  }
+
+  // 3. Use Eigen::JacobiSVD to compute rotation
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+
+  Eigen::Matrix3d V = svd.matrixV();
+  Eigen::Matrix3d U = svd.matrixU();
+
+  Eigen::Matrix3d R = V * U.transpose();
+
+  // 4. Handle special reflection case
+  if (R.determinant() < 0) {
+    V.col(2) *= -1;
+    R = V * U.transpose();
+  }
+
+  // 5. Compute translation t
+  Eigen::Vector3d t = target_centroid - R * source_centroid;
+
+  // Build the transformation matrix
   Eigen::Matrix4d transformation = Eigen::Matrix4d::Identity(4, 4);
+  transformation.block<3, 3>(0, 0) = R;
+  transformation.block<3, 1>(0, 3) = t;
+
   return transformation;
 }
 
@@ -116,6 +157,14 @@ std::tuple<double, double, double> computeAngularFeatures (const Eigen::Vector3d
   return {alpha, phi, theta};
 }
 
+double compute_l2_distance(const std::vector<double>& desc1, const std::vector<double>& desc2) {
+    double sum = 0.0;
+    for (size_t i = 0; i < desc1.size(); ++i) {
+        double diff = desc1[i] - desc2[i];
+        sum += diff * diff;
+    }
+    return sqrt(sum);
+}
 
 void Registration::execute_descriptor_registration()
 {
@@ -216,15 +265,6 @@ void Registration::execute_descriptor_registration()
   // 5. Match descriptors using manual distance computation
   std::vector<Eigen::Vector2i> correspondences;
   
-  auto compute_l2_distance = [](const std::vector<double>& desc1, const std::vector<double>& desc2) -> double {
-    double sum = 0.0;
-    for (size_t i = 0; i < desc1.size(); ++i) {
-      double diff = desc1[i] - desc2[i];
-      sum += diff * diff;
-    }
-    return sqrt(sum);
-  };
-  
   // For each source descriptor, find the best match in target descriptors
   for (size_t i = 0; i < source_fpfh.size(); ++i) {
     double best_distance = std::numeric_limits<double>::max();
@@ -244,7 +284,7 @@ void Registration::execute_descriptor_registration()
   }
 
   // 6. Estimate initial transformation using RANSAC
-  auto result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
+  open3d::pipelines::registration::RegistrationResult result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
     *source_downsampled, *target_downsampled, correspondences,
     voxel_size * 1.5,
     open3d::pipelines::registration::TransformationEstimationPointToPoint(false),
