@@ -213,25 +213,37 @@ void Registration::execute_descriptor_registration()
   compute_fpfh(source_downsampled, source_kd_tree, source_sfpfh, source_fpfh);
   compute_fpfh(target_downsampled, target_kd_tree, target_sfpfh, target_fpfh);
 
-  // 5. Build descriptor points cloud
-  std::shared_ptr<open3d::geometry::PointCloud> source_desc = std::make_shared<open3d::geometry::PointCloud>();
-  std::shared_ptr<open3d::geometry::PointCloud> target_desc = std::make_shared<open3d::geometry::PointCloud>();
-  for (auto& f: source_fpfh) source_desc->points_.emplace_back(Eigen::Vector3d::Zero()), source_desc->normals_.emplace_back(Eigen::Vector3d::Map(f.data(), f.size()));
-  for (auto& f: target_fpfh) target_desc->points_.emplace_back(Eigen::Vector3d::Zero()), target_desc->normals_.emplace_back(Eigen::Vector3d::Map(f.data(), f.size()));
-
-  // 6. Match descriptors
-  open3d::geometry::KDTreeFlann descriptor_kd_tree(*target_desc);
-  descriptor_kd_tree.SetMatrixData(Eigen::Map<const Eigen::MatrixXd>((double*)target_desc->normals_.data(), target_fpfh[0].size(), target_fpfh.size()));
+  // 5. Match descriptors using manual distance computation
   std::vector<Eigen::Vector2i> correspondences;
-  for (size_t i = 0; i < source_fpfh.size(); i++) {
-    std::vector<int> idx(1);
-    std::vector<double> dist(1);
-    Eigen::VectorXd query = Eigen::Map<const Eigen::VectorXd>(source_fpfh[i].data(), source_fpfh[i].size());
-    int n = descriptor_kd_tree.SearchKNN(query, 1, idx, dist);
-    if (!idx.empty()) correspondences.emplace_back(i, idx[0]);
+  
+  auto compute_l2_distance = [](const std::vector<double>& desc1, const std::vector<double>& desc2) -> double {
+    double sum = 0.0;
+    for (size_t i = 0; i < desc1.size(); ++i) {
+      double diff = desc1[i] - desc2[i];
+      sum += diff * diff;
+    }
+    return sqrt(sum);
+  };
+  
+  // For each source descriptor, find the best match in target descriptors
+  for (size_t i = 0; i < source_fpfh.size(); ++i) {
+    double best_distance = std::numeric_limits<double>::max();
+    int best_match = -1;
+    
+    for (size_t j = 0; j < target_fpfh.size(); ++j) {
+      double distance = compute_l2_distance(source_fpfh[i], target_fpfh[j]);
+      if (distance < best_distance) {
+        best_distance = distance;
+        best_match = j;
+      }
+    }
+    
+    if (best_match >= 0) {
+      correspondences.emplace_back(i, best_match);
+    }
   }
 
-  // 7. Estimate initial transformation using RANSAC
+  // 6. Estimate initial transformation using RANSAC
   auto result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
     *source_downsampled, *target_downsampled, correspondences,
     voxel_size * 1.5,
