@@ -1,7 +1,7 @@
 # Instruction to run the code
-mkdir build & cd build
-cmake ..
-make
+mkdir build & cd build \n
+cmake .. \n
+make \n
 
 ## In the data folder there are the dataset used 
 For running:
