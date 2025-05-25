@@ -169,11 +169,10 @@ Eigen::Matrix4d Registration::get_svd_icp_transformation(std::vector<size_t> sou
 }
 
 // Helper function to calculate Darboux frame features for a point pair
-// Helper function to calculate Darboux frame features for a point pair
 // This computes the angular features (alpha, phi, theta) used in FPFH descriptors
 // based on the Darboux frame constructed from two points and their normals
 std::tuple<double, double, double> computeAngularFeatures (const Eigen::Vector3d& s, const Eigen::Vector3d& n_s,
-                              const Eigen::Vector3d& t, const Eigen::Vector3d& n_t) {
+                                                          const Eigen::Vector3d& t, const Eigen::Vector3d& n_t) {
   // Build Darboux frame at point s
   Eigen::Vector3d u = n_s.normalized();  // Normal at source point
   Eigen::Vector3d d = (t - s).normalized();  // Direction vector from source to target
@@ -224,6 +223,10 @@ void Registration::execute_descriptor_registration()
   source_downsampled->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size * 2, 30));
   target_downsampled->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size * 2, 30));
 
+  // Detect the keypoints in both point clouds
+  std::shared_ptr<open3d::geometry::PointCloud> source_keypoints = open3d::geometry::keypoint::ComputeISSKeypoints(*source_downsampled);
+  std::shared_ptr<open3d::geometry::PointCloud> target_keypoints = open3d::geometry::keypoint::ComputeISSKeypoints(*target_downsampled);
+
   // 3. Setup parameters for FPFH (Fast Point Feature Histogram) computation
   const double radius = 0.1; // Radius for neighborhood search
   const int bins = 11; // Number of bins for each feature (alpha, phi, theta)
@@ -231,8 +234,10 @@ void Registration::execute_descriptor_registration()
   const double theta_bin = 2 * M_PI / bins;  // Size of theta bin for normalization (theta range [0, 2π])
   
   // Build KD-trees for efficient nearest neighbor search
-  open3d::geometry::KDTreeFlann source_kd_tree(*source_downsampled);
-  open3d::geometry::KDTreeFlann target_kd_tree(*target_downsampled);
+  // open3d::geometry::KDTreeFlann source_kd_tree(*source_downsampled);
+  // open3d::geometry::KDTreeFlann target_kd_tree(*target_downsampled);
+  open3d::geometry::KDTreeFlann source_kd_tree(*source_keypoints);
+  open3d::geometry::KDTreeFlann target_kd_tree(*target_keypoints);
   
   // Lambda function to compute Simplified Fast Point Feature Histogram (SFPFH) features
   // SFPFH is the first step of FPFH computation - computes local features for each point
@@ -254,7 +259,7 @@ void Registration::execute_descriptor_registration()
       if (idx.size() < 5) continue; // Skip points with too few neighbors
       
       // For each neighbor, compute angular features and update histogram
-      for (size_t j = 1; j < idx.size(); ++j) { // Skip self (idx[0])
+      for (size_t j = 1; j < idx.size(); ++j) { 
         size_t k = idx[j];
         // Compute Darboux frame features between current point and neighbor
         auto [alpha, phi, theta] = computeAngularFeatures(p, n_p, cloud->points_[k], cloud->normals_[k]);
@@ -279,8 +284,10 @@ void Registration::execute_descriptor_registration()
 
   // Compute SFPFH for both source and target point clouds
   std::vector<std::vector<double>> source_sfpfh, target_sfpfh;
-  compute_sfpfh(source_downsampled, source_kd_tree, source_sfpfh);
-  compute_sfpfh(target_downsampled, target_kd_tree, target_sfpfh);
+  // compute_sfpfh(source_downsampled, source_kd_tree, source_sfpfh);
+  // compute_sfpfh(target_downsampled, target_kd_tree, target_sfpfh);
+  compute_sfpfh(source_keypoints, source_kd_tree, source_sfpfh);
+  compute_sfpfh(target_keypoints, target_kd_tree, target_sfpfh);
 
   // 4. Compute the final FPFH (Fast Point Feature Histogram) descriptors
   // FPFH enhances SFPFH by incorporating weighted contributions from neighboring SFPFH
@@ -323,8 +330,10 @@ void Registration::execute_descriptor_registration()
 
   // Compute final FPFH descriptors for both point clouds
   std::vector<std::vector<double>> source_fpfh, target_fpfh;
-  compute_fpfh(source_downsampled, source_kd_tree, source_sfpfh, source_fpfh);
-  compute_fpfh(target_downsampled, target_kd_tree, target_sfpfh, target_fpfh);
+  // compute_fpfh(source_downsampled, source_kd_tree, source_sfpfh, source_fpfh);
+  // compute_fpfh(target_downsampled, target_kd_tree, target_sfpfh, target_fpfh);
+  compute_fpfh(source_keypoints, source_kd_tree, source_sfpfh, source_fpfh);
+  compute_fpfh(target_keypoints, target_kd_tree, target_sfpfh, target_fpfh);
 
   /*
   // Alternative: Manual descriptor matching (slower but more explicit)
@@ -370,14 +379,21 @@ void Registration::execute_descriptor_registration()
 
   // 6. Estimate initial transformation using RANSAC-based correspondence matching
   // RANSAC removes outlier correspondences and estimates robust transformation
+  // open3d::pipelines::registration::RegistrationResult result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
+  //   *source_downsampled, *target_downsampled, correspondences,
+  //   voxel_size * 1.5,  // Maximum correspondence distance threshold
+  //   open3d::pipelines::registration::TransformationEstimationPointToPoint(false), // Point-to-point estimation
+  //   3,  // Minimum number of correspondences for valid transformation
+  //   std::vector<std::reference_wrapper<const open3d::pipelines::registration::CorrespondenceChecker>>{}, // No additional checkers
+  //   open3d::pipelines::registration::RANSACConvergenceCriteria(4000000, 500)); // Max iterations and confidence
   open3d::pipelines::registration::RegistrationResult result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
-    *source_downsampled, *target_downsampled, correspondences,
+    *source_keypoints, *target_keypoints, correspondences,
     voxel_size * 1.5,  // Maximum correspondence distance threshold
     open3d::pipelines::registration::TransformationEstimationPointToPoint(false), // Point-to-point estimation
     3,  // Minimum number of correspondences for valid transformation
     std::vector<std::reference_wrapper<const open3d::pipelines::registration::CorrespondenceChecker>>{}, // No additional checkers
     open3d::pipelines::registration::RANSACConvergenceCriteria(4000000, 500)); // Max iterations and confidence
-  
+
   // Store the estimated transformation matrix
   transformation_ = result.transformation_;
 }
