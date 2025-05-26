@@ -31,8 +31,15 @@ int main(int argc, char *argv[]) {
     std::cout << "ICP Refinement Time: " << time_icp << " ms" << std::endl;
     std::cout << "Final RMSE: " << registration.compute_rmse() << std::endl;
 
-    registration.write_tranformation_matrix("transformation_final.txt");
-    registration.save_merged_cloud("merged_final.ply");
+    // registration.write_tranformation_matrix("transformation_final.txt");
+    // registration.save_merged_cloud("merged_final.ply");
+    // Parse the command line to get the name of the point cloud
+    std::string path = std::string(argv[1]);
+    size_t last_slash = path.find_last_of('/');
+    size_t second_last_slash = path.find_last_of('/', last_slash - 1);
+    std::string name = path.substr(second_last_slash + 1, last_slash - second_last_slash - 1);
+    registration.write_tranformation_matrix("../results/" + name + "_transformation_final.txt");
+    registration.save_merged_cloud("../results/" + name + "_merged_final.ply");
 
     return 0;
 }
