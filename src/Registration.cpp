@@ -213,9 +213,6 @@ void Registration::execute_descriptor_registration()
 // - Do NOT use any part of ICP here; this must be a pure descriptor-based initial alignment.
 // - Store the estimated transformation matrix in `transformation_`.
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  // Configuration flag: set to true to use keypoints, false to use all downsampled points
-  const bool use_keypoints = true;
-  
   // 1. Perform a downsampling of the point clouds to reduce computational complexity
   const double voxel_size = 0.05;
   std::shared_ptr<open3d::geometry::PointCloud> source_downsampled = source_.VoxelDownSample(voxel_size);
@@ -229,65 +226,59 @@ void Registration::execute_descriptor_registration()
   // Select which point clouds to use based on configuration
   std::shared_ptr<open3d::geometry::PointCloud> source_features, target_features;
   
-  if (use_keypoints) {
-    auto compute_harris_response = [](std::shared_ptr<open3d::geometry::PointCloud> cloud, const double radius) {
-      std::vector<double> harris_response(cloud->points_.size(), 0.0);
-      open3d::geometry::KDTreeFlann kd_tree(*cloud);
+  auto compute_harris_response = [](std::shared_ptr<open3d::geometry::PointCloud> cloud, const double radius) {
+    std::vector<double> harris_response(cloud->points_.size(), 0.0);
+    open3d::geometry::KDTreeFlann kd_tree(*cloud);
 
-      for (size_t i = 0; i < cloud->points_.size(); i++) {
-        std::vector<int> idx;
-        std::vector<double> dist;
-        kd_tree.SearchRadius(cloud->points_[i], radius, idx, dist);
-        if (idx.size() < 5) continue;
+    for (size_t i = 0; i < cloud->points_.size(); i++) {
+      std::vector<int> idx;
+      std::vector<double> dist;
+      kd_tree.SearchRadius(cloud->points_[i], radius, idx, dist);
+      if (idx.size() < 5) continue;
 
-        Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
-        Eigen::Vector3d mean = Eigen::Vector3d::Zero();
-        for (int j: idx) mean += cloud->points_[j];
-        mean /= idx.size();
-        for (int j: idx) {
-          Eigen::Vector3d diff = cloud->points_[j] - mean;
-          covariance += diff * diff.transpose();
-        }
-        covariance /= idx.size();
-
-        double k = 0.04;
-        double det = covariance.determinant();
-        double trace = covariance.trace();
-        harris_response[i] = det - k * trace * trace;
+      Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+      Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+      for (int j: idx) mean += cloud->points_[j];
+      mean /= idx.size();
+      for (int j: idx) {
+        Eigen::Vector3d diff = cloud->points_[j] - mean;
+        covariance += diff * diff.transpose();
       }
+      covariance /= idx.size();
 
-      return harris_response;
-    };
+      double k = 0.04;
+      double det = covariance.determinant();
+      double trace = covariance.trace();
+      harris_response[i] = det - k * trace * trace;
+    }
 
-    auto detect_harris_keypoints = [](std::shared_ptr<open3d::geometry::PointCloud> cloud,
-                                     const std::vector<double>& harris_response,
-                                     size_t num_keypoints) {
-      std::vector<size_t> indices(harris_response.size());
-      std::iota(indices.begin(), indices.end(), 0);
-      std::sort(indices.begin(), indices.end(),
-                [&harris_response](size_t a, size_t b) { return harris_response[a] > harris_response[b]; });
-      auto result = std::make_shared<open3d::geometry::PointCloud>();
-      for (size_t i = 0; i < std::min(num_keypoints, indices.size()); i++) {
-        result->points_.push_back(cloud->points_[indices[i]]);
-        result->normals_.push_back(cloud->normals_[indices[i]]);
-      }
-      return result;
-    };
+    return harris_response;
+  };
 
-    const double radius = voxel_size * 2;
-    size_t num_keypoints = 100;
-    std::vector<double> source_harris_response = compute_harris_response(source_downsampled, radius);
-    std::vector<double> target_harris_response = compute_harris_response(target_downsampled, radius);
-    source_features = detect_harris_keypoints(source_downsampled, source_harris_response, num_keypoints);
-    target_features = detect_harris_keypoints(target_downsampled, target_harris_response, num_keypoints);
-  } else {
-    // Use all downsampled points
-    source_features = source_downsampled;
-    target_features = target_downsampled;
-  }
+  auto detect_harris_keypoints = [](std::shared_ptr<open3d::geometry::PointCloud> cloud,
+                                    const std::vector<double>& harris_response,
+                                    size_t num_keypoints) {
+    std::vector<size_t> indices(harris_response.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(indices.begin(), indices.end(),
+              [&harris_response](size_t a, size_t b) { return harris_response[a] > harris_response[b]; });
+    auto result = std::make_shared<open3d::geometry::PointCloud>();
+    for (size_t i = 0; i < std::min(num_keypoints, indices.size()); i++) {
+      result->points_.push_back(cloud->points_[indices[i]]);
+      result->normals_.push_back(cloud->normals_[indices[i]]);
+    }
+    return result;
+  };
 
-  // 3. Setup parameters for FPFH (Fast Point Feature Histogram) computation
   const double radius = voxel_size * 2;
+  size_t num_keypoints = 100;
+  std::vector<double> source_harris_response = compute_harris_response(source_downsampled, radius);
+  std::vector<double> target_harris_response = compute_harris_response(target_downsampled, radius);
+  source_features = detect_harris_keypoints(source_downsampled, source_harris_response, num_keypoints);
+  target_features = detect_harris_keypoints(target_downsampled, target_harris_response, num_keypoints);
+  
+  // 3. Setup parameters for FPFH (Fast Point Feature Histogram) computation
+  // const double radius = voxel_size * 2;
   const int bins = 11;
   const double bin_size = 2.0 / bins;
   const double theta_bin = 2 * M_PI / bins;
