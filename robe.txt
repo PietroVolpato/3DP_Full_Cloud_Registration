@@ -1,0 +1,916 @@
+/*void Registration::execute_descriptor_registration()
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Implement a registration method based entirely on manually implemented feature descriptors.
+// - Preprocess the point clouds (e.g., downsampling).
+// - Detect keypoints in both source and target clouds.
+// - Compute descriptors manually (histogram-based, geometric, etc.) without any built-in functions.
+// - Match descriptors and estimate initial correspondences.
+// - Use RANSAC or other robust method to reject outliers and estimate an initial rigid transformation.
+//   (You may use Open3D's RegistrationRANSACBasedOnCorrespondence() as long as descriptors and matches are computed manually.)
+// - Do NOT use any part of ICP here; this must be a pure descriptor-based initial alignment.
+// - Store the estimated transformation matrix in `transformation_`.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // 1. Perform a downsampling of the point clouds to reduce computational complexity
+  const double voxel_size = 0.05;
+  shared_ptr<open3d::geometry::PointCloud> source_downsampled = source_.VoxelDownSample(voxel_size);
+  shared_ptr<open3d::geometry::PointCloud> target_downsampled = target_.VoxelDownSample(voxel_size);
+
+  // 2. Estimate normals for both point clouds using KD-tree hybrid search
+  // Normals are required for computing geometric features
+  source_downsampled->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size * 2, 30));
+  target_downsampled->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size * 2, 30));
+
+  // Select which point clouds to use based on configuration
+  shared_ptr<open3d::geometry::PointCloud> source_features, target_features;
+  
+  auto compute_harris_response = [](shared_ptr<open3d::geometry::PointCloud> cloud, const double radius) {
+    vector<double> harris_response(cloud->points_.size(), 0.0);
+    open3d::geometry::KDTreeFlann kd_tree(*cloud);
+
+    for (size_t i = 0; i < cloud->points_.size(); i++) {
+      vector<int> idx;
+      vector<double> dist;
+      kd_tree.SearchRadius(cloud->points_[i], radius, idx, dist);
+      if (idx.size() < 5) continue;
+
+      Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+      Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+      for (int j: idx) mean += cloud->points_[j];
+      mean /= idx.size();
+      for (int j: idx) {
+        Eigen::Vector3d diff = cloud->points_[j] - mean;
+        covariance += diff * diff.transpose();
+      }
+      covariance /= idx.size();
+
+      double k = 0.04;
+      double det = covariance.determinant();
+      double trace = covariance.trace();
+      harris_response[i] = det - k * trace * trace;
+    }
+
+    return harris_response;
+  };
+
+  auto detect_harris_keypoints = [](shared_ptr<open3d::geometry::PointCloud> cloud,
+                                    const vector<double>& harris_response,
+                                    size_t num_keypoints) {
+    vector<size_t> indices(harris_response.size());
+    iota(indices.begin(), indices.end(), 0);
+    sort(indices.begin(), indices.end(),
+              [&harris_response](size_t a, size_t b) { return harris_response[a] > harris_response[b]; });
+    auto result = make_shared<open3d::geometry::PointCloud>();
+    for (size_t i = 0; i < min(num_keypoints, indices.size()); i++) {
+      result->points_.push_back(cloud->points_[indices[i]]);
+      result->normals_.push_back(cloud->normals_[indices[i]]);
+    }
+    return result;
+  };
+
+  const double radius = voxel_size * 2;
+  size_t num_keypoints = 100;
+  vector<double> source_harris_response = compute_harris_response(source_downsampled, radius);
+  vector<double> target_harris_response = compute_harris_response(target_downsampled, radius);
+  source_features = detect_harris_keypoints(source_downsampled, source_harris_response, num_keypoints);
+  target_features = detect_harris_keypoints(target_downsampled, target_harris_response, num_keypoints);
+  
+  // 3. Setup parameters for FPFH (Fast Point Feature Histogram) computation
+  // const double radius = voxel_size * 2;
+  const int bins = 11;
+  const double bin_size = 2.0 / bins;
+  const double theta_bin = 2 * M_PI / bins;
+  
+  // Build KD-trees for efficient nearest neighbor search
+  open3d::geometry::KDTreeFlann source_kd_tree(*source_features);
+  open3d::geometry::KDTreeFlann target_kd_tree(*target_features);
+  
+  // Lambda function to compute Simplified Fast Point Feature Histogram (SFPFH) features
+  auto compute_sfpfh = [&](shared_ptr<open3d::geometry::PointCloud> cloud,
+                           open3d::geometry::KDTreeFlann& kd_tree,
+                           vector<vector<double>>& sfpfh) {
+    size_t num_points = cloud->points_.size();
+    sfpfh.resize(num_points, vector<double>(bins * 3, 0.0));
+    vector<int> idx;
+    vector<double> dist;
+    
+    for (size_t i = 0; i < num_points; i++) {
+      Eigen::Vector3d p = cloud->points_[i];
+      Eigen::Vector3d n_p = cloud->normals_[i];
+      
+      int n = kd_tree.SearchRadius(p, radius, idx, dist);
+      if (idx.size() < 5) continue;
+      
+      for (size_t j = 1; j < idx.size(); ++j) { 
+        size_t k = idx[j];
+        auto [alpha, phi, theta] = computeAngularFeatures(p, n_p, cloud->points_[k], cloud->normals_[k]);
+        
+        int alpha_bin = min(bins - 1, int((alpha + 1) / bin_size));
+        int phi_bin = min(bins - 1, int((phi + 1) / bin_size));
+        int theta_bin = min(bins - 1, int((theta + M_PI) / bin_size));
+        
+        sfpfh[i][alpha_bin] += 1.0;
+        sfpfh[i][bins + phi_bin] += 1.0;
+        sfpfh[i][2 * bins + theta_bin] += 1.0;
+      }
+      
+      double sum = 0.0;
+      for (double val : sfpfh[i]) sum += val;
+      if (sum > 0) for (double& val : sfpfh[i]) val /= sum;
+    }
+  };
+
+  // Compute SFPFH for both source and target point clouds
+  vector<vector<double>> source_sfpfh, target_sfpfh;
+  compute_sfpfh(source_features, source_kd_tree, source_sfpfh);
+  compute_sfpfh(target_features, target_kd_tree, target_sfpfh);
+
+  // 4. Compute the final FPFH (Fast Point Feature Histogram) descriptors
+  auto compute_fpfh = [&](shared_ptr<open3d::geometry::PointCloud> cloud,
+                          open3d::geometry::KDTreeFlann& kd_tree,
+                          const vector<vector<double>>& sfpfh,
+                          vector<vector<double>>& fpfh) {
+    size_t num_points = cloud->points_.size();
+    fpfh = sfpfh;
+    vector<int> idx;
+    vector<double> dist;
+    
+    for (size_t i = 0; i < num_points; i++) {
+      Eigen::Vector3d p = cloud->points_[i];
+      int n = kd_tree.SearchRadius(p, radius, idx, dist);
+      
+      double weight_sum = 0.0;
+      vector<double> acc(bins * 3, 0.0);
+      
+      for (size_t j = 0; j < n; j++) {
+        double weight = 1.0 / (dist[j] + 1e-6);
+        weight_sum += weight;
+        auto& neighbor = sfpfh[idx[j]];
+        for (size_t k = 0; k < bins * 3; k++) acc[k] += weight * neighbor[k];
+      }
+      
+      if (weight_sum > 0) {
+        for (size_t k = 0; k < bins * 3; k++) fpfh[i][k] = acc[k] / weight_sum;
+      }
+      
+      double sum = 0.0;
+      for (double val : fpfh[i]) sum += val;
+      if (sum > 0) for (double& val : fpfh[i]) val /= sum;
+    }
+  };
+
+  // Compute final FPFH descriptors for both point clouds
+  vector<vector<double>> source_fpfh, target_fpfh;
+  compute_fpfh(source_features, source_kd_tree, source_sfpfh, source_fpfh);
+  compute_fpfh(target_features, target_kd_tree, target_sfpfh, target_fpfh);
+  
+  // 5. Match descriptors efficiently using KD-tree in descriptor space
+  Eigen::MatrixXd matched_target(target_fpfh[0].size(), target_fpfh.size());
+  for (size_t i = 0; i < target_fpfh.size(); i++)
+    matched_target.col(i) = Eigen::Map<const Eigen::VectorXd>(target_fpfh[i].data(), target_fpfh[i].size());
+
+  open3d::geometry::KDTreeFlann descriptor_kd_tree(matched_target);
+  vector<Eigen::Vector2i> correspondences;
+  
+  for (size_t i = 0; i < source_fpfh.size(); i++) {
+    vector<int> idx(1);
+    vector<double> dist(1);
+    Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(source_fpfh[i].data(), source_fpfh[i].size());
+    descriptor_kd_tree.SearchKNN(q, 1, idx, dist);
+    if (!idx.empty()) correspondences.emplace_back(i, idx[0]);
+  }
+
+  // 6. Estimate initial transformation using RANSAC-based correspondence matching
+  open3d::pipelines::registration::RegistrationResult result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
+    *source_features, *target_features, correspondences,
+    voxel_size * 1.5,
+    open3d::pipelines::registration::TransformationEstimationPointToPoint(false),
+    5,
+    vector<reference_wrapper<const open3d::pipelines::registration::CorrespondenceChecker>>{},
+    open3d::pipelines::registration::RANSACConvergenceCriteria(4000000, 500));
+
+  // Store the estimated transformation matrix
+  transformation_ = result.transformation_;
+}*/
+
+/*void Registration::execute_descriptor_registration() {
+    // 1. Downsample for keypoint detection
+    double voxel_size = 0.05;
+    auto src_ds = source_.VoxelDownSample(voxel_size);
+    auto tgt_ds = target_.VoxelDownSample(voxel_size);
+    if (!src_ds || !tgt_ds || src_ds->points_.empty() || tgt_ds->points_.empty()) {
+        std::cerr << "Downsampled clouds are empty, aborting descriptor registration." << std::endl;
+        return;
+    }
+    src_ds->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size * 2, 30));
+    tgt_ds->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size * 2, 30));
+
+    // 2. Manual Harris3D on downsampled
+    auto compute_harris = [&](shared_ptr<open3d::geometry::PointCloud> pc) {
+        vector<double> resp(pc->points_.size(), 0.0);
+        open3d::geometry::KDTreeFlann tree(*pc);
+        double r = voxel_size * 2.5;
+        double k = 0.04;
+        for (size_t i = 0; i < pc->points_.size(); ++i) {
+            vector<int> idx;
+            vector<double> d2;
+            tree.SearchRadius(pc->points_[i], r, idx, d2);
+            if (idx.size() < 5) continue;
+            Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+            for (int j : idx) mean += pc->points_[j];
+            mean /= idx.size();
+            Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+            for (int j : idx) {
+                Eigen::Vector3d dpt = pc->points_[j] - mean;
+                cov += dpt * dpt.transpose();
+            }
+            cov /= idx.size();
+            double tr = cov.trace();
+            double det = cov.determinant();
+            resp[i] = det - k * tr * tr;
+        }
+        return resp;
+    };
+
+    auto resp_s = compute_harris(src_ds);
+    auto resp_t = compute_harris(tgt_ds);
+    if (resp_s.empty() || resp_t.empty()) {
+        std::cerr << "Harris responses empty, aborting descriptor registration." << std::endl;
+        return;
+    }
+
+    // 3. Select top-K keypoints
+    size_t K = 200;
+    auto pick_coords = [&](shared_ptr<open3d::geometry::PointCloud> pc, const vector<double> &resp) {
+        vector<size_t> ids(resp.size());
+        iota(ids.begin(), ids.end(), 0);
+        if (ids.size() > K) {
+            partial_sort(ids.begin(), ids.begin() + K, ids.end(), [&](size_t a, size_t b) { return resp[a] > resp[b]; });
+            ids.resize(K);
+        }
+        vector<Eigen::Vector3d> pts;
+        pts.reserve(ids.size());
+        for (size_t idx : ids) pts.push_back(pc->points_[idx]);
+        return pts;
+    };
+    auto kp_s = pick_coords(src_ds, resp_s);
+    auto kp_t = pick_coords(tgt_ds, resp_t);
+    if (kp_s.empty() || kp_t.empty()) {
+        std::cerr << "No keypoints selected, aborting descriptor registration." << std::endl;
+        return;
+    }
+
+    // 4. Map keypoints back to original
+    source_.EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size * 2, 30));
+    target_.EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size * 2, 30));
+    open3d::geometry::KDTreeFlann tree_s_orig(source_);
+    open3d::geometry::KDTreeFlann tree_t_orig(target_);
+    vector<size_t> idx_s; idx_s.reserve(kp_s.size());
+    vector<size_t> idx_t; idx_t.reserve(kp_t.size());
+    for (auto &p : kp_s) {
+        vector<int> i1(1);
+        vector<double> d1(1);
+        tree_s_orig.SearchKNN(p, 1, i1, d1);
+        if (!i1.empty()) idx_s.push_back(i1[0]);
+    }
+    for (auto &p : kp_t) {
+        vector<int> i1(1);
+        vector<double> d1(1);
+        tree_t_orig.SearchKNN(p, 1, i1, d1);
+        if (!i1.empty()) idx_t.push_back(i1[0]);
+    }
+    if (idx_s.empty() || idx_t.empty()) {
+        std::cerr << "Mapping keypoints failed, aborting descriptor registration." << std::endl;
+        return;
+    }
+
+    // 5. Compute SPFH on original keypoints
+    auto compute_spfh = [&](const open3d::geometry::PointCloud &pc, const vector<size_t> &kidx, vector<vector<double>> &out) {
+        double r = voxel_size * 5;
+        int B = 11;
+        double sb = 2.0 / B;
+        double tb = 2 * M_PI / B;
+        open3d::geometry::KDTreeFlann tree(pc);
+        out.assign(kidx.size(), vector<double>(3 * B, 0.0));
+        for (size_t i = 0; i < kidx.size(); ++i) {
+            size_t id = kidx[i];
+            vector<int> idx;
+            vector<double> d2;
+            tree.SearchRadius(pc.points_[id], r, idx, d2);
+            if (idx.size() < 5) continue;
+            for (size_t j = 1; j < idx.size(); ++j) {
+                auto [a, phi, th] = computeAngularFeatures(pc.points_[id], pc.normals_[id], pc.points_[idx[j]], pc.normals_[idx[j]]);
+                int ai = min(B - 1, int((a + 1) / sb));
+                int pi = min(B - 1, int((phi + 1) / sb));
+                int ti = min(B - 1, int((th + M_PI) / tb));
+                out[i][ai]++;
+                out[i][B + pi]++;
+                out[i][2 * B + ti]++;
+            }
+            double sum = 0.0;
+            for (double v : out[i]) sum += v;
+            if (sum > 0) for (double &v : out[i]) v /= sum;
+        }
+    };
+    vector<vector<double>> spfh_s, spfh_t;
+    compute_spfh(source_, idx_s, spfh_s);
+    compute_spfh(target_, idx_t, spfh_t);
+
+    // 6. Accumulate FPFH on original keypoints
+    auto compute_fpfh = [&](const open3d::geometry::PointCloud &pc,
+                             const vector<size_t> &kidx,
+                             const vector<vector<double>> &spf,
+                             vector<vector<double>> &fpfh) {
+        double r = voxel_size * 5;
+        int B = 11;
+        open3d::geometry::KDTreeFlann tree(pc);
+        fpfh = spf;
+        
+        // Create mapping from point index to keypoint index
+        std::unordered_map<size_t, size_t> point_to_keypoint;
+        for (size_t i = 0; i < kidx.size(); ++i) {
+            point_to_keypoint[kidx[i]] = i;
+        }
+        
+        for (size_t i = 0; i < kidx.size(); ++i) {
+            size_t id = kidx[i];
+            vector<int> idx;
+            vector<double> d2;
+            tree.SearchRadius(pc.points_[id], r, idx, d2);
+            double wsum = 0.0;
+            vector<double> acc(3 * B, 0.0);
+            
+            for (size_t j = 1; j < idx.size(); ++j) {
+                // Check if this neighbor is also a keypoint
+                auto it = point_to_keypoint.find(static_cast<size_t>(idx[j]));
+                if (it == point_to_keypoint.end()) continue; // Skip if not a keypoint
+                
+                size_t neighbor_keypoint_idx = it->second;
+                double w = 1.0 / (sqrt(d2[j]) + 1e-6);
+                wsum += w;
+                for (int b = 0; b < 3 * B; ++b)
+                    acc[b] += spf[neighbor_keypoint_idx][b] * w;
+            }
+            if (wsum > 0) {
+                for (int b = 0; b < 3 * B; ++b)
+                    fpfh[i][b] += acc[b] / wsum;
+            }
+            double sum = 0.0;
+            for (double v : fpfh[i]) sum += v;
+            if (sum > 0) for (double &v : fpfh[i]) v /= sum;
+        }
+    };
+    vector<vector<double>> fpfh_s, fpfh_t;
+    compute_fpfh(source_, idx_s, spfh_s, fpfh_s);
+    compute_fpfh(target_, idx_t, spfh_t, fpfh_t);
+
+    // 7. Descriptor matching + RANSAC
+    if (fpfh_s.empty() || fpfh_t.empty()) {
+        std::cerr << "FPFH descriptors empty, aborting descriptor registration." << std::endl;
+        return;
+    }
+    Eigen::MatrixXd MT(fpfh_t[0].size(), fpfh_t.size());
+    for (size_t i = 0; i < fpfh_t.size(); ++i) MT.col(i) = Eigen::Map<const Eigen::VectorXd>(fpfh_t[i].data(), fpfh_t[i].size());
+    open3d::geometry::KDTreeFlann tree_desc(MT);
+    vector<Eigen::Vector2i> corr;
+    corr.reserve(fpfh_s.size());
+    for (size_t i = 0; i < fpfh_s.size(); ++i) {
+        vector<int> id(1);
+        vector<double> d2(1);
+        Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(fpfh_s[i].data(), fpfh_s[i].size());
+        tree_desc.SearchKNN(q, 1, id, d2);
+        if (!id.empty()) corr.emplace_back(i, id[0]);
+    }
+    if (corr.empty()) {
+        std::cerr << "No correspondences found, aborting descriptor registration." << std::endl;
+        return;
+    }
+    auto result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
+        source_, target_, corr,
+        voxel_size * 1.5,
+        open3d::pipelines::registration::TransformationEstimationPointToPoint(false),
+        3, 
+        vector<reference_wrapper<const open3d::pipelines::registration::CorrespondenceChecker>>{},
+        open3d::pipelines::registration::RANSACConvergenceCriteria(50000, 500)
+    );
+    transformation_ = result.transformation_;
+}*/
+
+#include "Registration.h"
+#include <functional>
+
+using namespace std;
+
+Registration::Registration(string cloud_source_filename, string cloud_target_filename)
+{
+  open3d::io::ReadPointCloud(cloud_source_filename, source_ );
+  open3d::io::ReadPointCloud(cloud_target_filename, target_ );
+  source_for_icp_ = source_;
+}
+
+Registration::Registration(open3d::geometry::PointCloud cloud_source, open3d::geometry::PointCloud cloud_target)
+{
+  source_ = cloud_source;
+  target_ = cloud_target;
+  source_for_icp_ = source_;
+}
+
+
+void Registration::execute_icp_registration(double threshold, int max_iteration, double relative_rmse, string mode)
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// For each iteration (for manual ICP implementation):
+// 1. Find the closest point correspondences using find_closest_point().
+// 2. Use get_svd_icp_transformation() to estimate transformation.
+// 3. Apply transformation to source.
+// 4. Accumulate transformation and check RMSE convergence.
+//
+// Note: You are allowed to use Open3D’s RegistrationRANSACBasedOnCorrespondence()
+// to compute the initial transformation, if you have already computed descriptors
+// and correspondences manually. However, high-level functions like RegistrationICP are not allowed.
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Initialize variables for ICP iteration
+  double prev_rmse = numeric_limits<double>::max();
+  transformation_ = Eigen::Matrix4d::Identity();  // Start with identity transformation
+  source_for_icp_ = source_;  // Reset source cloud for ICP processing
+  
+  // Main ICP iteration loop
+  for (size_t i = 0; i < max_iteration; i++) {
+    // 1. Find closest point correspondences between source and target
+    auto [source_indices, target_indices, rmse] = find_closest_point(threshold);
+    
+    // 2. Check for convergence based on RMSE change
+    if (abs(prev_rmse - rmse) < relative_rmse) {
+      cout << "Converged after " << i << " iterations with RMSE: " << rmse << endl;
+      break;
+    }
+    prev_rmse = rmse;  // Update previous RMSE for next iteration comparison
+    
+    // 3. Estimate transformation using SVD-based point-to-point ICP
+    Eigen::Matrix4d transformation = get_svd_icp_transformation(source_indices, target_indices);
+    
+    // 4. Apply transformation to source cloud for next iteration
+    source_for_icp_.Transform(transformation);
+    
+    // 5. Accumulate transformations (T_total = T_current * T_previous)
+    transformation_ = transformation * transformation_;
+  }
+}
+
+
+tuple<vector<size_t>, vector<size_t>, double> Registration::find_closest_point(double threshold)
+{
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // 1. Use KDTreeFlann to search the closest target point for each source point.
+    // 2. If distance < threshold, record the pair and update RMSE.
+    // 3. Return source indices, target indices, and final RMSE.
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // Build KD-Tree for efficient nearest neighbor search in target point cloud
+    open3d::geometry::KDTreeFlann target_kd_tree(target_);
+    
+    // Initialize containers for storing valid correspondence pairs
+    vector<size_t> source_indices;
+    vector<size_t> target_indices;
+    
+    // Initialize variables for RMSE calculation
+    double mse = 0.0;
+    size_t count = 0;
+    vector<int> idx(1);      // Storage for nearest neighbor index
+    vector<double> dist(1);  // Storage for squared distance to nearest neighbor
+
+    // Iterate through all points in the source cloud
+    for (size_t i = 0; i < source_for_icp_.points_.size(); i++) {
+      // Find the closest point in target cloud using KD-Tree
+      target_kd_tree.SearchKNN(source_for_icp_.points_[i], 1, idx, dist);
+      
+      // Check if the distance is within the threshold (note: dist[0] is squared distance)
+      if (dist[0] < threshold * threshold) {
+      // Store the correspondence pair
+      source_indices.push_back(i);
+      target_indices.push_back(idx[0]);
+      
+      // Update running mean squared error using incremental formula
+      mse = ((count * mse) + dist[0]) / (count + 1);
+      count++;
+      }
+    }
+    
+    // Calculate RMSE from MSE, or return max value if no valid correspondences found
+    double rmse = count > 0 ? sqrt(mse) : numeric_limits<double>::max();
+    
+    return {source_indices, target_indices, rmse};
+}
+
+Eigen::Matrix4d Registration::get_svd_icp_transformation(vector<size_t> source_indices, vector<size_t> target_indices)
+{
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // 1. Compute centroids of source and target points.
+  // 2. Subtract centroids and construct matrix H.
+  // 3. Use Eigen::JacobiSVD to compute rotation.
+  // 4. Handle special reflection case if det(R) < 0.
+  // 5. Compute translation t and build 4x4 matrix.
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // 1. Compute centroids
+  size_t N = source_indices.size();
+  Eigen::MatrixXd S(3, N), T(3, N);
+  for (size_t i = 0; i < N; i++) {
+    S.col(i) = source_for_icp_.points_[source_indices[i]];
+    T.col(i) = target_.points_[target_indices[i]];
+  }
+  Eigen::Vector3d centroid_s = S.rowwise().mean();
+  Eigen::Vector3d centroid_t = T.rowwise().mean();
+
+  // 2. Center the points
+  Eigen::MatrixXd S_centered = S.colwise() - centroid_s;
+  Eigen::MatrixXd T_centered = T.colwise() - centroid_t;
+
+  Eigen::Matrix3d H = S_centered * T_centered.transpose();
+
+  // 3. Compute SVD
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  Eigen::Matrix3d U = svd.matrixU();
+  Eigen::Matrix3d V = svd.matrixV();
+
+  // Get the rotation matrix
+  Eigen::Matrix3d R = V * U.transpose();
+
+  // 4. Handle reflection case
+  if (R.determinant() < 0) {
+    V.col(2) *= -1; // Flip the last column of V
+    R = V * U.transpose();
+  }
+
+  // 5. Compute translation
+  Eigen::Vector3d t = centroid_t - R * centroid_s;
+
+  // Build the transformation matrix
+  Eigen::Matrix4d transformation = Eigen::Matrix4d::Identity();
+  transformation.block<3, 3>(0, 0) = R;
+  transformation.block<3, 1>(0, 3) = t;
+
+  return transformation;
+}
+
+// Helper function to calculate Darboux frame features for a point pair
+// This computes the angular features (alpha, phi, theta) used in FPFH descriptors
+// based on the Darboux frame constructed from two points and their normals
+tuple<double, double, double> computeAngularFeatures (const Eigen::Vector3d& s, const Eigen::Vector3d& n_s,
+                                                          const Eigen::Vector3d& t, const Eigen::Vector3d& n_t) {
+  // Build Darboux frame at point s
+  Eigen::Vector3d u = n_s.normalized();  // Normal at source point
+  Eigen::Vector3d d = (t - s).normalized();  // Direction vector from source to target
+  Eigen::Vector3d v = d.cross(u).normalized();  // First tangent vector (perpendicular to u and d)
+  Eigen::Vector3d w = u.cross(v);  // Second tangent vector (completes the orthogonal frame)
+
+  // Compute the three angular features
+  double alpha = v.dot(n_t);  // Angle between v and target normal
+  double phi = u.dot(d);      // Angle between source normal and connection vector
+  double theta = atan2(w.dot(n_t), u.dot(n_t));  // Rotation angle around the connection vector
+
+  return {alpha, phi, theta};
+}
+
+// Helper function to compute L2 (Euclidean) distance between two feature descriptors
+// Used for matching descriptors between source and target point clouds
+double compute_l2_distance(const vector<double>& desc1, const vector<double>& desc2) {
+  double sum = 0.0;
+  // Sum squared differences between corresponding elements
+  for (size_t i = 0; i < desc1.size(); ++i) {
+    double diff = desc1[i] - desc2[i];
+    sum += diff * diff;
+  }
+  // Return square root of sum (Euclidean distance)
+  return sqrt(sum);
+}
+
+void Registration::execute_descriptor_registration() {
+    // 1. Increased-density downsample for better features
+    double voxel_size = 0.03;  // reduced voxel for finer detail
+    auto src_ds = source_.VoxelDownSample(voxel_size);
+    auto tgt_ds = target_.VoxelDownSample(voxel_size);
+    if (!src_ds || !tgt_ds) return;
+    src_ds->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size*2,30));
+    tgt_ds->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size*2,30));
+
+    // 2. Manual Harris3D on downsampled
+    auto compute_harris = [&](shared_ptr<open3d::geometry::PointCloud> pc) {
+        size_t N = pc->points_.size();
+        vector<double> resp(N,0.0);
+        open3d::geometry::KDTreeFlann tree(*pc);
+        double r = voxel_size*2.5, k=0.04;
+        for(size_t i=0;i<N;++i){
+            vector<int> idx; vector<double>d2;
+            tree.SearchRadius(pc->points_[i],r,idx,d2);
+            if(idx.size()<5) continue;
+            Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+            for(int j:idx) mean += pc->points_[j]; mean/=idx.size();
+            Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+            for(int j:idx){ auto dp = pc->points_[j]-mean; cov += dp*dp.transpose(); }
+            cov /= idx.size(); double tr=cov.trace(), det=cov.determinant();
+            resp[i] = det - k*tr*tr;
+        }
+        return resp;
+    };
+    auto resp_s = compute_harris(src_ds);
+    auto resp_t = compute_harris(tgt_ds);
+
+    // 3. Pick more keypoints with partial_sort
+    size_t K = 500;
+    auto pick_pts = [&](shared_ptr<open3d::geometry::PointCloud> pc, const vector<double>&resp){
+        size_t N=resp.size(); vector<size_t> ids(N);
+        iota(ids.begin(),ids.end(),0);
+        if(N>K) partial_sort(ids.begin(), ids.begin()+K, ids.end(), [&](size_t a,size_t b){ return resp[a]>resp[b]; });
+        ids.resize(min(K,N)); vector<Eigen::Vector3d> pts; pts.reserve(ids.size());
+        for(size_t id:ids) pts.push_back(pc->points_[id]); return pts;
+    };
+    auto kp_s = pick_pts(src_ds,resp_s);
+    auto kp_t = pick_pts(tgt_ds,resp_t);
+
+    // 4. Map keypoints back to original
+    source_.EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size*2,30));
+    target_.EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(voxel_size*2,30));
+    open3d::geometry::KDTreeFlann tree_s(source_), tree_t(target_);
+    vector<size_t> idx_s, idx_t;
+    for(auto&p:kp_s){ vector<int> i1(1); vector<double>d1(1);
+        tree_s.SearchKNN(p,1,i1,d1); if(!i1.empty()) idx_s.push_back(i1[0]); }
+    for(auto&p:kp_t){ vector<int> i1(1); vector<double>d1(1);
+        tree_t.SearchKNN(p,1,i1,d1); if(!i1.empty()) idx_t.push_back(i1[0]); }
+
+    // 5-6. Compute FPFH on original keypoints (reuse existing SPFH+accum code)
+    auto compute_spfh = [&](const open3d::geometry::PointCloud &pc, const vector<size_t> &kidx, vector<vector<double>> &out) {
+        double r = voxel_size * 5;
+        int B = 11;
+        double sb = 2.0 / B;
+        double tb = 2 * M_PI / B;
+        open3d::geometry::KDTreeFlann tree(pc);
+        out.assign(kidx.size(), vector<double>(3 * B, 0.0));
+        for (size_t i = 0; i < kidx.size(); ++i) {
+            size_t id = kidx[i];
+            vector<int> idx;
+            vector<double> d2;
+            tree.SearchRadius(pc.points_[id], r, idx, d2);
+            if (idx.size() < 5) continue;
+            for (size_t j = 1; j < idx.size(); ++j) {
+                auto [a, phi, th] = computeAngularFeatures(pc.points_[id], pc.normals_[id], pc.points_[idx[j]], pc.normals_[idx[j]]);
+                int ai = min(B - 1, int((a + 1) / sb));
+                int pi = min(B - 1, int((phi + 1) / sb));
+                int ti = min(B - 1, int((th + M_PI) / tb));
+                out[i][ai]++;
+                out[i][B + pi]++;
+                out[i][2 * B + ti]++;
+            }
+            double sum = 0.0;
+            for (double v : out[i]) sum += v;
+            if (sum > 0) for (double &v : out[i]) v /= sum;
+        }
+    };
+    vector<vector<double>> spfh_s, spfh_t, fpfh_s, fpfh_t;
+    compute_spfh(source_, idx_s, spfh_s);
+    compute_spfh(target_, idx_t, spfh_t);
+
+    auto compute_fpfh = [&](const open3d::geometry::PointCloud &pc, const vector<size_t> &kidx, const vector<vector<double>> &spf, vector<vector<double>> &fpfh) {
+        double r = voxel_size * 5;
+        int B = 11;
+        open3d::geometry::KDTreeFlann tree(pc);
+        fpfh = spf;
+        
+        // Create mapping from point index to keypoint index
+        std::unordered_map<size_t, size_t> point_to_keypoint;
+        for (size_t i = 0; i < kidx.size(); ++i) {
+            point_to_keypoint[kidx[i]] = i;
+        }
+        
+        for (size_t i = 0; i < kidx.size(); ++i) {
+            size_t id = kidx[i];
+            vector<int> idx;
+            vector<double> d2;
+            tree.SearchRadius(pc.points_[id], r, idx, d2);
+            double wsum = 0.0;
+            vector<double> acc(3 * B, 0.0);
+            
+            for (size_t j = 1; j < idx.size(); ++j) {
+                // Check if this neighbor is also a keypoint
+                auto it = point_to_keypoint.find(static_cast<size_t>(idx[j]));
+                if (it == point_to_keypoint.end()) continue; // Skip if not a keypoint
+                
+                size_t neighbor_keypoint_idx = it->second;
+                double w = 1.0 / (sqrt(d2[j]) + 1e-6);
+                wsum += w;
+                for (int b = 0; b < 3 * B; ++b)
+                    acc[b] += spf[neighbor_keypoint_idx][b] * w;
+            }
+            if (wsum > 0) {
+                for (int b = 0; b < 3 * B; ++b)
+                    fpfh[i][b] += acc[b] / wsum;
+            }
+            double sum = 0.0;
+            for (double v : fpfh[i]) sum += v;
+            if (sum > 0) for (double &v : fpfh[i]) v /= sum;
+        }
+    };
+    
+    compute_fpfh(source_, idx_s, spfh_s, fpfh_s);
+    compute_fpfh(target_, idx_t, spfh_t, fpfh_t);
+
+    // 7. Descriptor matching + RANSAC
+    Eigen::MatrixXd mat_t(fpfh_t[0].size(), fpfh_t.size());
+    for(size_t i=0;i<fpfh_t.size();++i) mat_t.col(i)=Eigen::Map<const Eigen::VectorXd>(fpfh_t[i].data(),fpfh_t[i].size());
+    open3d::geometry::KDTreeFlann desc_tree(mat_t);
+    vector<Eigen::Vector2i> corr; corr.reserve(fpfh_s.size());
+    for(size_t i=0;i<fpfh_s.size();++i){ vector<int> ids(1); vector<double>d2(1);
+        Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(fpfh_s[i].data(),fpfh_s[i].size());
+        desc_tree.SearchKNN(q,1,ids,d2); if(!ids.empty()) corr.emplace_back(i,ids[0]); }
+    auto ransac_result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
+        *src_ds, *tgt_ds, corr,
+        voxel_size*1.5,
+        open3d::pipelines::registration::TransformationEstimationPointToPoint(false),
+        4,
+        vector<reference_wrapper<const open3d::pipelines::registration::CorrespondenceChecker>>{},
+        open3d::pipelines::registration::RANSACConvergenceCriteria(50000, 500)
+    );
+    transformation_ = ransac_result.transformation_;
+
+    // 8. Manual point-to-plane ICP refinement on full clouds
+    int icp_iters = 30;
+    double max_corr = voxel_size*1.2;
+    for(int iter=0; iter<icp_iters; ++iter) {
+        open3d::geometry::PointCloud source_tmp = source_;
+        source_tmp.Transform(transformation_);
+        open3d::geometry::KDTreeFlann kdt(target_);
+        vector<Eigen::VectorXd> A_rows;  // Store as VectorXd instead
+        vector<double> b_vals;
+        for(size_t i=0;i<source_tmp.points_.size();++i) {
+            vector<int> ids(1); vector<double>d2(1);
+            kdt.SearchKNN(source_tmp.points_[i],1,ids,d2);
+            if(d2[0] < max_corr*max_corr) {
+                Eigen::Vector3d pi = source_tmp.points_[i];
+                Eigen::Vector3d pj = target_.points_[ids[0]];
+                Eigen::Vector3d n = target_.normals_[ids[0]];
+                
+                // Create 6D Jacobian row: [n×pi, n]
+                Eigen::VectorXd Ai(6);
+                Eigen::Vector3d cross_product = n.cross(pi);
+                Ai << cross_product(0), cross_product(1), cross_product(2), n(0), n(1), n(2);
+                
+                double bi = n.dot(pj - pi);
+                A_rows.push_back(Ai);
+                b_vals.push_back(bi);
+            }
+        }
+        if(A_rows.empty()) break;
+        size_t M = b_vals.size();
+        Eigen::MatrixXd A(M,6);
+        Eigen::VectorXd b(M);
+        for(size_t i=0;i<M;++i) {
+            A.row(i) = A_rows[i].transpose();  // Transpose to get row
+            b(i) = b_vals[i];
+        }
+        Eigen::VectorXd x = (A.transpose()*A).ldlt().solve(A.transpose()*b);
+        Eigen::Matrix3d dR = (Eigen::Matrix3d() <<
+            0, -x(2), x(1), x(2), 0, -x(0), -x(1), x(0), 0).finished();
+        Eigen::Matrix4d dT = Eigen::Matrix4d::Identity();
+        dT.block<3,3>(0,0) += dR;
+        dT.block<3,1>(0,3) = x.segment<3>(3);
+        transformation_ = dT * transformation_;
+    }
+}
+
+void Registration::execute_descriptor_registration() {
+    double voxel_size = 0.05;
+    auto source_down = source_.VoxelDownSample(voxel_size);
+    auto target_down = target_.VoxelDownSample(voxel_size);
+
+    double radius_normal = voxel_size * 2.0;
+    source_down->EstimateNormals(open3d::geometry::KDTreeSearchParamRadius(radius_normal), 30);
+    target_down->EstimateNormals(open3d::geometry::KDTreeSearchParamRadius(radius_normal), 30);
+
+    double radius_feature = voxel_size * 5.0;
+    open3d::geometry::KDTreeFlann source_kd_tree(*source_down);
+    open3d::geometry::KDTreeFlann target_kd_tree(*target_down);
+
+    int bins = 11;  // Standard for FPFH
+    double bin_size_angle = M_PI / bins;
+    double bin_size_distance = radius_feature / bins;
+
+    auto compute_descriptor = [&](const open3d::geometry::PointCloud& cloud, const open3d::geometry::KDTreeFlann& tree, int idx, double radius, int bins) {
+        std::vector<int> indices;
+        std::vector<double> dists;
+        tree.SearchRadius(cloud.points_[idx], radius, indices, dists);
+
+        std::vector<double> hist_d(bins, 0.0);
+        std::vector<double> hist_alpha(bins, 0.0);
+        std::vector<double> hist_beta(bins, 0.0);
+
+        Eigen::Vector3d n_p = cloud.normals_[idx];
+        double total_weight = 0.0;
+
+        for (size_t i = 0; i < indices.size(); ++i) {
+            int j = indices[i];
+            if (j == idx) continue;
+
+            Eigen::Vector3d n_q = cloud.normals_[j];
+            Eigen::Vector3d v = cloud.points_[j] - cloud.points_[idx];
+            double d = v.norm();
+            if (d < 1e-6) continue;
+
+            // Compute stable angles
+            double dot_nn = std::max(-1.0, std::min(1.0, n_p.dot(n_q)));
+            double dot_nv = std::max(-1.0, std::min(1.0, n_p.dot(v.normalized())));
+            
+            double alpha = std::acos(std::abs(dot_nn));  // Use absolute value for symmetry
+            double beta = std::acos(std::abs(dot_nv));
+
+            // Add third angle for better discrimination (FPFH-style)
+            Eigen::Vector3d u = v.cross(n_p).normalized();
+            double gamma = std::atan2(n_q.dot(u), n_q.dot(v.cross(n_p).cross(n_p).normalized()));
+            if (gamma < 0) gamma += 2 * M_PI;
+            
+            double w = 1.0 / (d + 1e-6);
+
+            int bin_d = std::min(static_cast<int>(d / radius * bins), bins - 1);
+            int bin_alpha = std::min(static_cast<int>(alpha / M_PI * bins), bins - 1);
+            int bin_beta = std::min(static_cast<int>(beta / M_PI * bins), bins - 1);
+
+            hist_d[bin_d] += w;
+            hist_alpha[bin_alpha] += w;
+            hist_beta[bin_beta] += w;
+            total_weight += w;
+        }
+
+        if (total_weight > 0) {
+            for (int i = 0; i < bins; ++i) {
+                hist_d[i] /= total_weight;
+                hist_alpha[i] /= total_weight;
+                hist_beta[i] /= total_weight;
+            }
+        }
+
+        std::vector<double> descriptor;
+        descriptor.insert(descriptor.end(), hist_d.begin(), hist_d.end());
+        descriptor.insert(descriptor.end(), hist_alpha.begin(), hist_alpha.end());
+        descriptor.insert(descriptor.end(), hist_beta.begin(), hist_beta.end());
+        return descriptor;
+    };
+
+    // Detect keypoints first (Harris, ISS, or uniform sampling)
+    auto detect_keypoints = [&](std::shared_ptr<open3d::geometry::PointCloud> cloud) {
+        return cloud->UniformDownSample(10);  // Every 10th point
+    };
+
+    auto source_keypoints = detect_keypoints(source_down);
+    auto target_keypoints = detect_keypoints(target_down);
+
+    // Compute descriptors only for keypoints
+    std::vector<std::vector<double>> source_descriptors(source_keypoints->points_.size());
+    std::vector<std::vector<double>> target_descriptors(target_keypoints->points_.size());
+
+    for (size_t i = 0; i < source_keypoints->points_.size(); ++i) {
+        source_descriptors[i] = compute_descriptor(*source_down, source_kd_tree, i, radius_feature, bins);
+    }
+
+    for (size_t i = 0; i < target_keypoints->points_.size(); ++i) {
+        target_descriptors[i] = compute_descriptor(*target_down, target_kd_tree, i, radius_feature, bins);
+    }
+
+    // Convert descriptors to matrix for KD-tree
+    Eigen::MatrixXd target_desc_matrix(target_descriptors[0].size(), target_descriptors.size());
+    for (size_t i = 0; i < target_descriptors.size(); ++i) {
+        target_desc_matrix.col(i) = Eigen::Map<const Eigen::VectorXd>(
+            target_descriptors[i].data(), target_descriptors[i].size());
+    }
+
+    open3d::geometry::KDTreeFlann desc_tree(target_desc_matrix);
+    std::vector<std::pair<int, int>> correspondences;
+
+    for (size_t i = 0; i < source_descriptors.size(); ++i) {
+        Eigen::VectorXd query = Eigen::Map<const Eigen::VectorXd>(
+            source_descriptors[i].data(), source_descriptors[i].size());
+        
+        std::vector<int> indices(1);
+        std::vector<double> dists(1);
+        desc_tree.SearchKNN(query, 1, indices, dists);
+        
+        correspondences.push_back(std::make_pair(i, indices[0]));
+    }
+
+    std::vector<Eigen::Vector2i> correspondence_set;
+    for (const auto& corr : correspondences) {
+        correspondence_set.push_back(Eigen::Vector2i(corr.first, corr.second));
+    }
+
+    double max_correspondence_dist = voxel_size * 1.5;
+    auto estimation = open3d::pipelines::registration::TransformationEstimationPointToPoint(false);
+    auto criteria = open3d::pipelines::registration::RANSACConvergenceCriteria(100000, 0.999);
+
+    auto result = open3d::pipelines::registration::RegistrationRANSACBasedOnCorrespondence(
+        *source_down, *target_down, 
+        correspondence_set,
+        max_correspondence_dist,
+        estimation,
+        3,
+        std::vector<std::reference_wrapper<const open3d::pipelines::registration::CorrespondenceChecker>>(),
+        criteria
+    );
+
+    transformation_ = result.transformation_;
+}
